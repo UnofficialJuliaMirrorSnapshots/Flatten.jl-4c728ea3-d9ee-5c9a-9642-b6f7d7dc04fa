@@ -1,15 +1,16 @@
 """
 Flatten.jl converts data between nested and flat structures, using `flatten()`,
 `reconstruct()` and `update!()` functions. This facilitates building modular,
-composed structs while allowing access to solvers and optimisers that require flat
-tyuples of parameters, or any other use case that requires extraction of a flat list
-of values from a nested type. Importantly it's type-stable and _very_ fast. 
+composable structs while allowing access to solvers and optimisers that require flat
+vectors of parameters -- or any other use case that requires extraction or modification
+of a list of values from a nested type. Importantly it's type-stable and _very_ fast.
 
 
-Flatten is also flexible. Overrides can be defined for custom types for all methods, while 
-custom querying methods and types can be used to extract and modify specify sets of fields
-from any nested type. Flatten allows 'querying' to extract some types and ignore others, 
-here using `flatten`:
+Flatten is also flexible. The types to use and ignore can be specified, and fields can be
+ignored using field level traits like `flattenable` from FieldMetadata.jl. Method overrides
+can also be defined for custom types.
+
+Flatten allows 'querying' to extract some types and ignore others, here using `flatten`:
 
 ```jldoctest
 julia> using Flatten
@@ -37,42 +38,59 @@ julia> flatten(Foo(:one, :two, Foo(Bar(:three), 4.0, :five)), Symbol, Bar) # Ret
 (:one, :two, :five)
 ```
 
-The default type used is `Number`, while `AbstractArray` is ignored. These rules apply 
+The default type used is `Number`, while `AbstractArray` is ignored. These rules apply
 to all Flatten.jl functions.
 
 Flatten.jl also uses [FieldMetadata.jl](https://github.com/rafaqz/FieldMetadata.jl)
-to provide `@flattenable` macro choose struct fields to include and remove from
-flattened, defaulting to `true` for all fields. Custom `@metadata` methods from
-FieldMetadata can be used, if they return a Bool. You can also use cusom
-functions that follow the following form, returning a boolean:
+to provide a `@flattenable` macro, allowing you to choose struct fields to include
+and remove from flattening -- defaulting to `true` for all fields.
+
+```jldoctest
+using Flatten
+import Flatten: flattenable
+
+@flattenable struct Bar{X,Y}
+    x::X | true
+    y::Y | false
+end
+
+flatten(Bar(1, 2))
+
+# output
+(1,)
+```
+Custom `@metadata` methods from FieldMetadata can be used, if they return a Bool.
+You can also use cusom functions that follow the following form, returning a boolean:
 
 ```julia
 f(::Type, ::Type{Var{:fieldname}}) = false
 ```
 
 Flatten also provides `metaflatten()` to flatten any FieldMetadata.jl
-metadata for the fields `flatten()` returns. This can be useful for attaching information
-like descriptions or optional units to each field. Regular field data can also be collected 
-with convenience versions of metaflatten: `fieldnameflatten`, `parentflatten`, 
-`fieldtypeflatten` and `parenttypeflatten` functions provide lists of fieldnames and types 
-that may be useful for building parameter display tables.
+metadata for the same fields `flatten()` returns. This can be useful for attaching
+information like descriptions or prior propability distributions to each field.
+Regular field data can also be collected with convenience versions of metaflatten:
+`fieldnameflatten`, `parentflatten`, `fieldtypeflatten` and `parenttypeflatten`
+functions provide lists of fieldnames and types that may be useful for building
+parameter display tables.
 
 
-This package was originally written by Robin Deits (@rdeits), and it owes much
-to further discussions and ideas from Jan Weidner (@jw3126) and Robin Deits.
+This package was started by Robin Deits (@rdeits), and its early development
+owes much to discussions and ideas from Jan Weidner (@jw3126) and Robin Deits.
 """
 module Flatten
 
 using FieldMetadata
 import FieldMetadata: @flattenable, @reflattenable, flattenable
 
-export @flattenable, @reflattenable, flattenable, flatten, reconstruct, update!,
+export @flattenable, @reflattenable, flattenable, flatten, reconstruct, update!, modify,
        metaflatten, fieldnameflatten, parentnameflatten, fieldtypeflatten, parenttypeflatten
 
 
-# Default behaviour when no use/ignore args are given
+# Default behaviour when no flattentrait/use/ignore args are given
 const USE = Number
 const IGNORE = AbstractArray
+const FLATTENTRAIT = flattenable
 
 
 # Generalised nested struct walker
@@ -80,8 +98,6 @@ nested(T::Type, expr_builder, expr_combiner, action) =
     nested(T, Nothing, expr_builder, expr_combiner, action)
 nested(T::Type, P::Type, expr_builder, expr_combiner, action) =
     expr_combiner(T, [Expr(:..., expr_builder(T, fn, action)) for fn in fieldnames(T)])
-
-default_combiner(T, expressions) = Expr(:tuple, expressions...)
 
 
 """
@@ -93,7 +109,6 @@ constructor_of(::Type{T}) where T<:Tuple = :tuple
 constructor_of(T::UnionAll) = constructor_of(T.body)
 
 
-
 """
     flatten(obj, [flattentrait::Function], [use::Type], [ignore::Type])
 
@@ -103,11 +118,14 @@ Query types and flatten trait arguments are optional, but you must pass `use` to
 
 # Arguments
 
-`obj`: The target type to be reconstructed
-`data`: Replacement data - an `AbstractArray`, `Tuple` or type that defines `getfield`.
-`flattentrait`: A function returning a Bool, with the form `f(::Type, ::Type{Val{:fieldname}}) = true`.
-`use`: Type or `Union` of types to return in the tuple.
-`ignore`: Types or `Union` of types  to ignore completly. These are not reurned or recursed over.
+- `obj`: The target type to be reconstructed
+- `data`: Replacement data - an `AbstractArray`, `Tuple` or type that defines `getfield`.
+- `flattentrait`: A function returning a Bool, such as a FielMetadata method. With the form:
+```julia
+f(::Type, ::Type{Val{:fieldname}}) = true
+```
+- `use`: Type or `Union` of types to return in the tuple.
+- `ignore`: Types or `Union` of types  to ignore completly. These are not reurned or recursed over.
 
 # Examples
 
@@ -165,23 +183,24 @@ function flatten end
 
 flatten_builder(T, fname, action) = quote
     if flattentrait($T, Val{$(QuoteNode(fname))})
-        $action(getfield(t, $(QuoteNode(fname))), flattentrait, use, ignore)
+        $action(getfield(obj, $(QuoteNode(fname))), flattentrait, use, ignore)
     else
         ()
     end
 end
 
+flatten_combiner(T, expressions) = Expr(:tuple, expressions...)
+
 flatten_inner(T, action) =
-    nested(T, flatten_builder, default_combiner, action)
+    nested(T, flatten_builder, flatten_combiner, action)
 
-flatten(t) = flatten(t, flattenable)
-flatten(t, args...) = flatten(t, flattenable, args...)
-flatten(t, ft::Function) = flatten(t, ft, USE)
-flatten(t, ft::Function, use) = flatten(t, ft, use, IGNORE)
-
+flatten(obj) = flatten(obj, flattenable)
+flatten(obj, args...) = flatten(obj, flattenable, args...)
+flatten(obj, ft::Function) = flatten(obj, ft, USE)
+flatten(obj, ft::Function, use) = flatten(obj, ft, use, IGNORE)
 flatten(x::I, ft::Function, use::Type{U}, ignore::Type{I}) where {U,I} = ()
 flatten(x::U, ft::Function, use::Type{U}, ignore::Type{I}) where {U,I} = (x,)
-@generated flatten(t, flattentrait::Function, use, ignore) = flatten_inner(t, flatten)
+@generated flatten(obj, flattentrait::Function, use, ignore) = flatten_inner(obj, flatten)
 
 
 """
@@ -192,12 +211,14 @@ Data should be at least as long as the queried fields in the obj.
 Query types and flatten trait arguments are optional, but you must pass `use` to pass `ignore`.
 
 # Arguments
-
-`obj`: The target type to be reconstructed
-`data`: Replacement data - an `AbstractArray`, `Tuple` or type that defines `getfield`.
-`flattentrait`: A function returning a Bool, with the form `f(::Type, ::Type{Val{:fieldname}}) = true`.
-`use`: Type or `Union` of types to return in the tuple.
-`ignore`: Types or `Union` of types  to ignore completly. These are not reurned or recursed over.
+- `obj`: The target type to be reconstructed
+- `data`: Replacement data - an `AbstractArray`, `Tuple` or type that defines `getfield`.
+- `flattentrait`: A function returning a Bool, such as a FielMetadata method. With the form:
+```julia
+f(::Type, ::Type{Val{:fieldname}}) = true
+```
+- `use`: Type or `Union` of types to return in the tuple.
+- `ignore`: Types or `Union` of types  to ignore completly. These are not reurned or recursed over.
 
 # Examples
 
@@ -216,11 +237,11 @@ function reconstruct end
 
 reconstruct_builder(T, fname, action) = quote
     if flattentrait($T, Val{$(QuoteNode(fname))})
-        x = getfield(t, $(QuoteNode(fname)))
+        x = getfield(obj, $(QuoteNode(fname)))
         val, n = $action(x, data, flattentrait, use, ignore, n)
         val
     else
-        (getfield(t, $(QuoteNode(fname))),)
+        (getfield(obj, $(QuoteNode(fname))),)
     end
 end
 
@@ -231,23 +252,32 @@ reconstruct_inner(::Type{T}, action) where T =
     nested(T, reconstruct_builder, reconstruct_combiner, action)
 
 
-reconstruct(t, data) = reconstruct(t, data, flattenable)
-reconstruct(t, data, args...) = reconstruct(t, data, flattenable, args...)
-reconstruct(t, data, ft::Function) = reconstruct(t, data, ft, USE)
-reconstruct(t, data, ft::Function, use) = reconstruct(t, data, ft, use, IGNORE)
+# Run from first data index and extract the final return value from the nested tuple
+reconstruct(obj, data) = reconstruct(obj, data, flattenable)
+reconstruct(obj, data, args...) = reconstruct(obj, data, flattenable, args...)
+reconstruct(obj, data, ft::Function) = reconstruct(obj, data, ft, USE)
+reconstruct(obj, data, ft::Function, use) = reconstruct(obj, data, ft, use, IGNORE)
 # Need to extract the final return value from the nested tuple
-reconstruct(t, data, ft::Function, use, ignore) =
-    reconstruct(t, data, ft, use, ignore, 1)[1][1]
-
+reconstruct(obj, data, ft::Function, use, ignore) =
+    reconstruct(obj, data, ft, use, ignore, 1)[1][1]
 # Return value unmodified
-reconstruct(x::I, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} =
-    (x,), n
+reconstruct(x::I, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} = (x,), n
 # Return value from data. Increment position counter -  the returned n + 1 becomes n
-reconstruct(x::U, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} =
-    (data[n],), n + 1
-@generated reconstruct(t, data, flattentrait::Function, use, ignore, n) =
-    reconstruct_inner(t, reconstruct)
+reconstruct(x::U, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} = (data[n],), n + 1
+@generated reconstruct(obj, data, flattentrait::Function, use, ignore, n) =
+    reconstruct_inner(obj, reconstruct)
 
+
+apply(func, data::Tuple{T, Vararg}) where T = (func(data[1]), apply(func, Base.tail(data))...)
+apply(func, data::Tuple{}) = ()
+
+"""
+    modify(func, obj, args...)
+
+Modify field in a type with a function
+
+"""
+modify(func, obj, args...) = reconstruct(obj, apply(func, (flatten(obj, args...))), args...)
 
 """
     update!(obj, data, [flattentrait::Function], [use::Type], [ignore::Type])
@@ -256,11 +286,14 @@ Query types and flatten trait arguments are optional, but you must pass `use` to
 
 # Arguments
 
-`obj`: The target type to be reconstructed
-`data`: Replacement data - an `AbstractArray`, `Tuple` or type that defines `getfield`.
-`flattentrait`: A function that returns true or false given a type and `Val{:fieldname}`.
-`use`: Types to return in the tuple.
-`ignore`: Types to ignore completly. These are not reurned or recursed over.
+- `obj`: The target type to be reconstructed
+- `data`: Replacement data - an `AbstractArray`, `Tuple` or type that defines `getfield`.
+- `flattentrait`: A function returning a Bool, such as a FielMetadat method. With the form:
+```julia
+f(::Type, ::Type{Val{:fieldname}}) = true
+```
+- `use`: Types to return in the tuple.
+- `ignore`: Types to ignore completly. These are not reurned or recursed over.
 
 # Examples
 
@@ -290,9 +323,9 @@ function update! end
 
 update_builder(T, fname, action) = quote
     if flattentrait($T, Val{$(QuoteNode(fname))})
-        x = getfield(t, $(QuoteNode(fname)))
+        x = getfield(obj, $(QuoteNode(fname)))
         val, n = $action(x, data, flattentrait, use, ignore, n)
-        setfield!(t, $(QuoteNode(fname)), val[1])
+        setfield!(obj, $(QuoteNode(fname)), val[1])
     end
     ()
 end
@@ -300,23 +333,23 @@ end
 # Use the reconstruct builder for tuples, they're immutable
 update_builder(T::Type{<:Tuple}, fname, action) = reconstruct_builder(T, fname, action)
 
-update_combiner(T, expressions) = :($(Expr(:tuple, expressions...)); ((t,), n))
+update_combiner(T, expressions) = :($(Expr(:tuple, expressions...)); ((obj,), n))
 update_combiner(T::Type{<:Tuple}, expressions) = reconstruct_combiner(T, expressions)
 
 update_inner(::Type{T}, action) where T =
     nested(T, update_builder, update_combiner, action)
 
-update!(t, data) = update!(t, data, flattenable)
-update!(t, data, args...) = update!(t, data, flattenable, args...)
-update!(t, data, ft::Function) = update!(t, data, ft, USE)
-update!(t, data, ft::Function, use) = update!(t, data, ft, use, IGNORE)
-update!(t, data, ft::Function, use, ignore) = begin
-    update!(t, data, ft, use, ignore, firstindex(data))[1][1]
-    t
+update!(obj, data) = update!(obj, data, flattenable)
+update!(obj, data, args...) = update!(obj, data, flattenable, args...)
+update!(obj, data, ft::Function) = update!(obj, data, ft, USE)
+update!(obj, data, ft::Function, use) = update!(obj, data, ft, use, IGNORE)
+update!(obj, data, ft::Function, use, ignore) = begin
+    update!(obj, data, ft, use, ignore, firstindex(data))[1][1]
+    obj
 end
 update!(x::I, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} = (x,), n
 update!(x::U, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} = (data[n],), n + 1
-@generated update!(t, data, flattentrait::Function, use, ignore, n) = update_inner(t, update!)
+@generated update!(obj, data, flattentrait::Function, use, ignore, n) = update_inner(obj, update!)
 
 
 """
@@ -327,11 +360,17 @@ Query types and flatten trait arguments are optional, but you must pass `use` to
 
 # Arguments
 
-`obj`: The target type to be reconstructed
-`func`: A function with the form `f(::Type, ::Type{Val{:fieldname}}) = metadata`.
-`flattentrait`: A function returning a Bool, with the form `f(::Type, ::Type{Val{:fieldname}}) = true`.
-`use`: Type or `Union` of types to return in the tuple.
-`ignore`: Types or `Union` of types  to ignore completly. These are not reurned or recursed over.
+- `obj`: The target type to be reconstructed
+- `func`: A function with the form: 
+```julia
+f(::Type, ::Type{Val{:fieldname}}) = metadata
+```
+- `flattentrait`: A function returning a Bool, such as a FielMetadata method. With the form:
+```julia
+f(::Type, ::Type{Val{:fieldname}}) = true
+```
+- `use`: Type or `Union` of types to return in the tuple.
+- `ignore`: Types or `Union` of types  to ignore completly. These are not reurned or recursed over.
 
 We can flatten the @foobar metadata defined earlier:
 
@@ -361,7 +400,7 @@ function metaflatten end
 
 metaflatten_builder(T, fname, action) = quote
     if flattentrait($T, Val{$(QuoteNode(fname))})
-        x = getfield(t, $(QuoteNode(fname)))
+        x = getfield(obj, $(QuoteNode(fname)))
         $action(x, func, flattentrait, use, ignore, $T, Val{$(QuoteNode(fname))})
     else
         ()
@@ -369,14 +408,14 @@ metaflatten_builder(T, fname, action) = quote
 end
 
 metaflatten_inner(T::Type, action) =
-    nested(T, metaflatten_builder, default_combiner, action)
+    nested(T, metaflatten_builder, flatten_combiner, action)
 
-metaflatten(t, func::Function) = metaflatten(t, func, flattenable)
-metaflatten(t, func::Function, args...) = metaflatten(t, func, flattenable, args...)
-metaflatten(t, func::Function, ft::Function) = metaflatten(t, func, ft, USE)
-metaflatten(t, func::Function, ft::Function, use) = metaflatten(t, func, ft, use, IGNORE)
-metaflatten(t, func::Function, ft::Function, use, ignore) =
-    metaflatten(t, func::Function, ft::Function, use, ignore, Nothing, Val{:none})
+metaflatten(obj, func::Function) = metaflatten(obj, func, flattenable)
+metaflatten(obj, func::Function, args...) = metaflatten(obj, func, flattenable, args...)
+metaflatten(obj, func::Function, ft::Function) = metaflatten(obj, func, ft, USE)
+metaflatten(obj, func::Function, ft::Function, use) = metaflatten(obj, func, ft, use, IGNORE)
+metaflatten(obj, func::Function, ft::Function, use, ignore) =
+    metaflatten(obj, func::Function, ft::Function, use, ignore, Nothing, Val{:none})
 
 metaflatten(x::I, func::Function, ft::Function, use::Type{U}, ignore::Type{I}, P, fname) where {U,I} = ()
 metaflatten(x::U, func::Function, ft::Function, use::Type{U}, ignore::Type{I}, P, fname) where {U,I} =
@@ -384,8 +423,8 @@ metaflatten(x::U, func::Function, ft::Function, use::Type{U}, ignore::Type{I}, P
 # Better field names for tuples.  TODO what about mixed type tuples?
 metaflatten(xs::NTuple{N,Number}, func::Function, ft::Function, use, ignore, P, fname) where {N} =
     map(x -> func(P, fname), xs)
-@generated metaflatten(t, func::Function, flattentrait::Function, use, ignore, P, fname) =
-    metaflatten_inner(t, metaflatten)
+@generated metaflatten(obj, func::Function, flattentrait::Function, use, ignore, P, fname) =
+    metaflatten_inner(obj, metaflatten)
 
 
 # Helper functions to get field data with metaflatten
@@ -394,7 +433,9 @@ fieldname_meta(T, ::Type{Val{N}}) where N = N
 
 
 """jldoctest
-    fieldnameflatten(t, args...)
+    fieldnameflatten(obj, args...)
+
+Flatten the field names of an object. Args are passed to metaflatten.
 
 # Examples
 
@@ -411,13 +452,15 @@ julia> fieldnameflatten(Foo(1, 2, 3))
 (:a, :b, :c)
 ```
 """
-fieldnameflatten(t, args...) = metaflatten(t, fieldname_meta, args...)
+fieldnameflatten(obj, args...) = metaflatten(obj, fieldname_meta, args...)
 
 
 fieldtype_meta(T, ::Type{Val{N}}) where N = fieldtype(T, N)
 
-"""jldoctest
-    fieldtypeflatten(t, args...)
+"""
+    fieldtypeflatten(obj, args...)
+
+Flatten the field types of an object. Args are passed to metaflatten.
 
 # Examples
 
@@ -434,14 +477,16 @@ julia> fieldtypeflatten(Foo(1.0, :two, "Three"), Union{Real,String})
 (Float64, String)
 ```
 """
-fieldtypeflatten(t, args...) = metaflatten(t, fieldtype_meta, args...)
+fieldtypeflatten(obj, args...) = metaflatten(obj, fieldtype_meta, args...)
 
 
 
 fieldparent_meta(T, ::Type{Val{N}}) where N = T.name.name
 
 """
-    parentnameflatten(t, args...)
+    parentnameflatten(obj, args...)
+
+Flatten the name of the parent type of an object. Args are passed to metaflatten.
 
 # Examples
 
@@ -463,13 +508,15 @@ julia> parentnameflatten(Foo(1, 2, Bar(3, 4)))
 (:Foo, :Foo, :Bar, :Bar)
 ```
 """
-parentnameflatten(t, args...) = metaflatten(t, fieldparent_meta, args...)
+parentnameflatten(obj, args...) = metaflatten(obj, fieldparent_meta, args...)
 
 
 fieldparenttype_meta(T, ::Type{Val{N}}) where N = T
 
 """
-    parenttypeflatten(t, args...)
+    parenttypeflatten(obj, args...)
+
+Flatten the parent type of an object. Args are passed to metaflatten.
 
 # Examples
 
@@ -491,7 +538,7 @@ julia> parenttypeflatten(Foo(1, 2, Bar(3, 4)))
 (Foo{Int64,Int64,Bar{Int64,Int64}}, Foo{Int64,Int64,Bar{Int64,Int64}}, Bar{Int64,Int64}, Bar{Int64,Int64})
 ```
 """
-parenttypeflatten(t, args...) = metaflatten(t, fieldparenttype_meta, args...)
+parenttypeflatten(obj, args...) = metaflatten(obj, fieldparenttype_meta, args...)
 
 
 end # module
