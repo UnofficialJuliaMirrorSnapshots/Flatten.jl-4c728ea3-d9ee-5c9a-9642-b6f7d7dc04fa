@@ -29,7 +29,7 @@ julia> obj = Foo(1, :two, Foo(Bar(3), 4.0, 5.0f0));
 
 julia> use = Union{Int, Float32}; # Immediately return Int and AbstractFloat fields
 
-julia> ignore = Bar;  # Dont return or iterate over AbstractArray fields
+julia> ignore = Bar;  # Dont return Bar or iterate over Bar fields
 
 julia> flatten(obj, use, ignore) # Flatten all Int and Float32 except fields of Bar
 (1, 5.0f0)
@@ -38,8 +38,7 @@ julia> flatten(Foo(:one, :two, Foo(Bar(:three), 4.0, :five)), Symbol, Bar) # Ret
 (:one, :two, :five)
 ```
 
-The default type used is `Number`, while `AbstractArray` is ignored. These rules apply
-to all Flatten.jl functions.
+The default type used is `Number`. These rules apply to all Flatten.jl functions.
 
 Flatten.jl also uses [FieldMetadata.jl](https://github.com/rafaqz/FieldMetadata.jl)
 to provide a `@flattenable` macro, allowing you to choose struct fields to include
@@ -86,10 +85,11 @@ import FieldMetadata: @flattenable, @reflattenable, flattenable
 export @flattenable, @reflattenable, flattenable, flatten, reconstruct, update!, modify,
        metaflatten, fieldnameflatten, parentnameflatten, fieldtypeflatten, parenttypeflatten
 
+struct EmptyIgnore end
 
 # Default behaviour when no flattentrait/use/ignore args are given
 const USE = Number
-const IGNORE = AbstractArray
+const IGNORE = EmptyIgnore 
 const FLATTENTRAIT = flattenable
 
 
@@ -259,7 +259,7 @@ reconstruct(obj, data, ft::Function) = reconstruct(obj, data, ft, USE)
 reconstruct(obj, data, ft::Function, use) = reconstruct(obj, data, ft, use, IGNORE)
 # Need to extract the final return value from the nested tuple
 reconstruct(obj, data, ft::Function, use, ignore) =
-    reconstruct(obj, data, ft, use, ignore, 1)[1][1]
+    reconstruct(obj, data, ft, use, ignore, firstindex(data))[1][1]
 # Return value unmodified
 reconstruct(x::I, data, ft::Function, use::Type{U}, ignore::Type{I}, n) where {U,I} = (x,), n
 # Return value from data. Increment position counter -  the returned n + 1 becomes n
